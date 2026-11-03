@@ -246,3 +246,59 @@ Static review found the core hardened. If pursuing a rewardable bug on a live in
 5. **Config/blob full-text search operators.** The parser is parameterized; still worth live-fuzzing `cfg:`/blob queries with exotic `jsonb` path and LIKE inputs for parser edge cases (confirm no injection, not DoS).
 
 None of the above is a confirmed vulnerability — they are the highest-value places to spend dynamic-testing time.
+
+---
+
+## 9. Addendum — file-by-file source→sink pass (new findings)
+
+A second pass traced user-controlled **sources** (request bodies/params, multipart options, uploaded bytes) to security-relevant **sinks** (capability gates, ACL writes, Karton headers, storage). It found two **application-layer authorization bypasses in the object (re)upload path** that the endpoint-matrix pass missed, because the capability gate exists only on the dedicated single-purpose endpoints and not on the shared upload code path.
+
+Both are reached identically by **file, config, and blob** uploads: `ObjectUploader.create_object` (`mwdb/resources/object.py:57`) → `*.get_or_create` → `Object._get_or_create` (`mwdb/model/object.py:480`). They are exploitable by the lowest-privileged account that holds **any one** upload capability (`adding_files` / `adding_configs` / `adding_blobs`), and — via re-upload of a sample the attacker already possesses (dedup grants access) — they let that account **modify state on an object that is also shared with other sharing groups**.
+
+### F8 — `adding_tags` capability bypass via (re)upload (cross-group tag/alt-name injection)
+- **Severity:** Low–Medium — CVSS 3.1 `AV:N/AC:L/PR:L/UI:N/S:C/C:N/I:L/A:N` (≈4.2)
+- **Scope class:** §9.3 (bypass app-layer authorization to perform an action without the required permission) + §9.2 (modify other users'/groups' data)
+- **Affected:** `mwdb/model/object.py:571-573` (`_get_or_create` → `add_tag`, no capability check); gate exists only at `mwdb/resources/tag.py:134` (`@requires_capabilities(adding_tags)`). Source: `tags` in `ObjectCreateRequestSchemaBase` (`schema/object.py:44`).
+- **Confidence:** Confirmed (static; grep shows `adding_tags` enforced only in `tag.py`).
+
+**Root cause.** The dedicated `POST /<type>/<id>/tag` endpoint requires `adding_tags`. The upload path adds tags straight from the request (`create_object` → `_get_or_create` → `add_tag(tag_name)`) with **no** `adding_tags` check. On re-upload of an existing object, those tags are written to the *existing* shared object.
+
+**Impact.** A user without `adding_tags` can attach arbitrary tags to objects. By re-uploading a sample they possess that is also shared with other groups, they inject tags visible to those groups (data-integrity / view-pollution across the sharing boundary; tags also drive search and quick-queries). The same path appends attacker-chosen `alt_names` to an existing `File` (`mwdb/model/file.py:128-134`) with no capability, which are searchable/displayed — same class.
+
+**Reproduction** (caller holds `adding_files`, not `adding_tags`):
+```
+POST /api/file   (multipart/form-data)
+  file    = <bytes of sample X already shared with group G>
+  options = {"tags":[{"tag":"pwned"}], "upload_as":"private"}
+→ 200; tag "pwned" is now on X and visible to every group sharing X.
+```
+
+**Fix.** In `create_object`, if `tags` is non-empty require `adding_tags` (raise `Forbidden`, as the attributes/parent paths already do for their capabilities), or drop tags when the capability is absent. Apply the same gate to the `alt_names` append on re-upload.
+
+### F9 — `modify_3rd_party_sharing` capability bypass via re-upload
+- **Severity:** Medium (when `enable_3rd_party_sharing_consent` is on) — CVSS 3.1 `AV:N/AC:L/PR:L/UI:N/S:C/C:L/I:L/A:N` (≈5.0); otherwise Low
+- **Scope class:** §9.3 (bypass authorization) and, by flipping an external-sharing decision, §3 (exposure of data to third parties)
+- **Affected:** `mwdb/model/object.py:575-576` (`share_3rd_party = existing or uploaded`, no capability check); gate exists only at `mwdb/resources/object.py:534-535` (`ObjectShare3rdPartyResource`, `@requires_capabilities(modify_3rd_party_sharing)`). Source: `share_3rd_party` in `ObjectCreateRequestSchemaBase` (`schema/object.py:45`, **default `True`**).
+- **Confidence:** Confirmed (static).
+
+**Root cause.** `share_3rd_party` marks an object as eligible for sharing with third parties and is propagated to the Karton pipeline header (`core/karton.py:57`). Changing it on an existing object is supposed to require `modify_3rd_party_sharing`. The upload path sets it directly with OR semantics: `created_object.share_3rd_party = created_object.share_3rd_party or share_3rd_party`. Because the schema default is `True`, **any** re-upload that doesn't explicitly send `false` flips an existing object's flag from `false`→`true`, with no capability check. (OR semantics mean it can only be turned on, which is the sensitive direction.)
+
+**Impact.** A user without `modify_3rd_party_sharing` can re-upload a sample they possess and force its third-party-sharing consent to `true`, overriding the owning group's explicit "do not share externally" decision and causing the sample to be marked shareable with 3rd parties in the analysis pipeline. Reachable with only an upload capability.
+
+**Reproduction** (caller holds `adding_files`, not `modify_3rd_party_sharing`; X currently `share_3rd_party=false`):
+```
+POST /api/file   (multipart/form-data)
+  file    = <bytes of X>
+  options = {"share_3rd_party": true, "upload_as":"private"}
+→ 200; X.share_3rd_party is now true (model/object.py:575), bypassing the
+  modify_3rd_party_sharing gate.
+```
+
+**Fix.** On re-upload, only let `share_3rd_party` change when the caller has `modify_3rd_party_sharing` (otherwise ignore the field for existing objects); consider making the schema default `False` so a plain client upload can't silently opt a sample into third-party sharing.
+
+### Minor observations from this pass (informational)
+- **Karton `execute` header is attribute-driven.** `prepare_headers` (`core/karton.py:60-63`) copies an object attribute named `execute` into the Karton task header (which can control detonation/execution in the pipeline). It is gated by the attribute's set-permission, but deployments that grant `execute` set-rights broadly effectively let those users steer the sandbox. Treat `execute` as a privileged attribute.
+- **`config_dhash` type collision.** `core/util.py:29-35` hashes `str(obj)` at leaves, so `123` (int) and `"123"` (str) dedup to the same config object — a config-dedup integrity edge case, not a direct security issue.
+- **All object attributes (incl. hidden) are sent to Karton** with `check_permissions=False` (`core/karton.py:94,125,149`) — intended (trusted backend), noted for completeness.
+
+These two findings (F8, F9) are the most likely of anything in this report to be accepted under the program (genuine app-layer authorization bypasses, low-priv reachable, cross-group effect), though still modest severity. They are confirmed by code; dynamic confirmation on a live instance is one `POST /api/file` each.
