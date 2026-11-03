@@ -7,6 +7,24 @@
 
 ---
 
+## 0. Bounty-scope reassessment (NASK PIB / CERT.pl program)
+
+After re-reading the published program scope, most of the original findings fall into **explicitly excluded** or **informational** buckets. Honest mapping:
+
+| # | Finding | Program scope verdict |
+|---|---------|----------------------|
+| F1 | `/config/stats` cross-group family metadata | **Borderline.** Could be argued under §3.3 (mass read of system data across the isolation boundary), but the review team may dismiss it under exclusion §2.3 "metadata/public-data leak". Submit, expect **low/informational**. |
+| F2 | Expensive-query DoS | **Excluded.** §10.1 "all forms of DoS are prohibited", §10.2 load testing. Do not submit. |
+| F3 | User enumeration + weak brute-force protection | **Excluded.** §2.2 user enumeration, §10.3 missing rate-limiting without an account-takeover path. Do not submit. |
+| F4 | `UserPendingResource` missing `@requires_authorization` (→500) | **Excluded/low.** Not an auth bypass (no state change, no data read); degrades to 500. At best §11.2 informational. |
+| F5 | `GroupMemberResource.delete` ordering (→500) | **Excluded.** No privilege escalation; pure 500/robustness. |
+| F6 | Peer email + last-login via `/profile/<login>` | **Low.** Email is PII (§3.1), but access requires sharing a workspace group with the victim and is arguably intended. Submit only as **low**, strongest if a community/multi-org workspace group exists. |
+| F7 | Missing `nosniff` on downloads | **Excluded.** §3.1 missing security headers. |
+
+**Verdict against the rewarded classes** (RCE, account takeover, IDOR/broken access control to other users' private data, privilege escalation, SQLi, SSRF, SSTI, XSS, file-upload→RCE, mass assignment, XXE, CORS-with-data-theft, path traversal): by **static review of this version I did not find a clearly-rewardable vulnerability.** The sensitive surfaces are hardened (see §4). Reaching a payout-grade bug on this target most likely requires **dynamic testing** against a live instance with specific group/sharing/plugin/OIDC configuration — which is out of scope for this static review. §8 lists where that effort should focus.
+
+---
+
 ## 1. Executive summary
 
 mwdb-core is a **mature, well-hardened** codebase. The areas that are classically the most dangerous for this kind of application — the custom Lucene→SQL search parser, the rich-attribute Markdown renderer, object access control, JWT handling, and file storage — have all clearly been hardened in response to earlier bug classes and held up under review. I did **not** find SQL injection, jsonpath injection, stored/reflected XSS, path traversal, authentication bypass, JWT forgery, or arbitrary cross-group object read.
@@ -214,3 +232,17 @@ Additionally `User.is_group_admin(group_id)` (`mwdb/model/user.py:247`) does `.f
 ## 7. Responsible disclosure
 
 The repo has **no `SECURITY.md`**. Report confirmed issues (primarily **F1**) privately to CERT Polska via a **GitHub Security Advisory** on `CERT-Polska/mwdb-core` (and/or `info@cert.pl`) **before** any public disclosure, and allow time for a fix/release. Do not publish reproduction details until a patched version is available.
+
+---
+
+## 8. Where payout-grade bugs are most likely (dynamic-test focus)
+
+Static review found the core hardened. If pursuing a rewardable bug on a live instance, concentrate here — each needs runtime/config that static review can't settle:
+
+1. **OIDC token/state binding (account takeover, §2).** `OpenIDAuthorizeResource`/`...Authenticate` create a *fresh, stateless* `OAuth2Session` per request (`core/oauth/provider.py:37`), so CSRF/replay protection rests entirely on the client echoing `state` and the `nonce` baked into the id_token (`core/oauth/client.py:parse_id_token`). Worth testing live: login-CSRF / code-injection by replaying another session's `code`+`state`, missing `state` binding, `nonce` reuse, and whether `fetch_id_token` rejects a token whose `aud`/`azp` differs. Also `iter_user_name_variants` → can a controlled `preferred_username` claim collide with / pre-empt a privileged login during `enable_oidc_registration`?
+2. **`share_queried_objects` / dedup access model (§9 IDOR).** `Object.access` auto-shares any object to a querying group that holds `share_queried_objects` (`model/object.py:609`), and re-uploading a known sample grants access via dedup. Probe whether these can be chained to read objects across groups without the intended capability, and whether relation-link permission propagation (`add_parent`/`uninherit_share`) can be driven to widen or revoke others' access.
+3. **Attribute `rich_template` / `url_template` rendering (§8 XSS).** The MarkedMustache renderer and `sanitizeUrl` are hardened, but a live test should fuzz attribute values against admin-defined rich templates (and the dagre-d3 `labelType:"html"` round-trip in `DagreD3Plot.tsx`) for a DOM-XSS escape, plus any `fromPlugins("mustacheExtensions")` lambdas a deployment loads.
+4. **Plugins (§1 RCE).** Out of the box this is admin-trusted, but on a target running community plugins, review each plugin's own endpoints/hooks for the usual classes — they inherit full app context.
+5. **Config/blob full-text search operators.** The parser is parameterized; still worth live-fuzzing `cfg:`/blob queries with exotic `jsonb` path and LIKE inputs for parser edge cases (confirm no injection, not DoS).
+
+None of the above is a confirmed vulnerability — they are the highest-value places to spend dynamic-testing time.
